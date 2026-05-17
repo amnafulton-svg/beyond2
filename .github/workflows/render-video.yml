@@ -4,14 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Release tag (e.g. v1, v2, v3)'
+        description: 'Release tag that contains one or more zip assets (e.g. v1)'
         required: true
         default: 'v1'
         type: string
       num_workers:
-        description: 'Number of parallel workers'
+        description: 'Parallel chunk workers per video'
         required: true
-        default: '6'
+        default: '2'
+        type: string
+      max_parallel_jobs:
+        description: 'Maximum total render jobs to run at once'
+        required: true
+        default: '10'
         type: string
       composition:
         description: 'Remotion composition ID'
@@ -23,101 +28,217 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.calc.outputs.matrix }}
-      zip_url: ${{ steps.find_zip.outputs.zip_url }}
+      render_matrix: ${{ steps.build.outputs.render_matrix }}
+      videos_matrix: ${{ steps.build.outputs.videos_matrix }}
+
     steps:
       - uses: actions/checkout@v4
-      - name: Find zip in release ${{ inputs.release_tag }}
-        id: find_zip
+
+      - name: Discover all zip files and build matrices
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          NUM_WORKERS: ${{ inputs.num_workers }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          ZIP_URL=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }} \
-            | grep "browser_download_url.*\.zip" \
-            | head -1 \
-            | cut -d '"' -f 4)
-          if [ -z "$ZIP_URL" ]; then
-            echo "❌ No .zip found in release ${{ inputs.release_tag }}"
-            echo "Available assets:"
-            curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }} \
-              | grep "browser_download_url" | cut -d '"' -f 4
-            exit 1
-          fi
-          echo "Found: $ZIP_URL"
-          echo "zip_url=$ZIP_URL" >> $GITHUB_OUTPUT
-      - name: Download and extract
-        run: |
-          curl -L -o assets.zip "${{ steps.find_zip.outputs.zip_url }}"
-          unzip -o assets.zip -d public/
-          ls -la public/
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: npm ci
-      - name: Calculate frame ranges
-        id: calc
-        run: |
-          TOTAL=$(node -e "const d=require('./public/scenes.json');console.log(Math.ceil(d.duration*30));")
-          echo "total_frames=$TOTAL" >> $GITHUB_OUTPUT
-          NUM_WORKERS=${{ inputs.num_workers }}
-          FPW=$(( (TOTAL + NUM_WORKERS - 1) / NUM_WORKERS ))
-          MATRIX="["
-          for i in $(seq 0 $((NUM_WORKERS - 1))); do
-            START=$((i * FPW))
-            END=$(( (i + 1) * FPW - 1 ))
-            [ $END -ge $TOTAL ] && END=$((TOTAL - 1))
-            [ $START -ge $TOTAL ] && break
-            [ "$MATRIX" != "[" ] && MATRIX="$MATRIX,"
-            MATRIX="$MATRIX{\"index\":$i,\"start\":$START,\"end\":$END}"
-          done
-          echo "matrix=${MATRIX}]" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          mkdir -p .tmp/assets .tmp/extract
+
+          curl -sSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+            -o release.json
+
+          python3 <<'PY'
+          import json, math, os, re, subprocess, sys
+          from pathlib import Path
+
+          release_path = Path('release.json')
+          if not release_path.exists():
+              sys.exit('release.json was not created')
+
+          with release_path.open('r', encoding='utf-8') as f:
+              release = json.load(f)
+
+          assets = [a for a in release.get('assets', []) if a.get('name', '').lower().endswith('.zip')]
+          if not assets:
+              sys.exit(f"❌ No .zip assets found in release {os.environ['RELEASE_TAG']}")
+
+          num_workers = int(os.environ['NUM_WORKERS'])
+          gh_token = os.environ['GH_TOKEN']
+
+          videos = []
+          render_jobs = []
+          used_ids = set()
+
+          for asset in assets:
+              asset_name = asset['name']
+              zip_url = asset['browser_download_url']
+
+              base_id = re.sub(r'[^A-Za-z0-9._-]+', '-', Path(asset_name).stem).strip('-').lower() or 'video'
+              video_id = base_id
+              suffix = 2
+
+              while video_id in used_ids:
+                  video_id = f"{base_id}-{suffix}"
+                  suffix += 1
+
+              used_ids.add(video_id)
+
+              local_zip = Path('.tmp/assets') / f"{video_id}.zip"
+              extract_dir = Path('.tmp/extract') / video_id
+              extract_dir.mkdir(parents=True, exist_ok=True)
+
+              subprocess.run([
+                  'curl', '-sSL',
+                  '-H', f'Authorization: Bearer {gh_token}',
+                  '-H', 'Accept: application/vnd.github+json',
+                  '-o', str(local_zip),
+                  zip_url,
+              ], check=True)
+
+              subprocess.run(
+                  ['unzip', '-o', str(local_zip), '-d', str(extract_dir)],
+                  check=True,
+                  stdout=subprocess.DEVNULL
+              )
+
+              scenes_path = extract_dir / 'scenes.json'
+
+              if not scenes_path.exists():
+                  sys.exit(f"❌ {asset_name} does not contain scenes.json at the root of the zip")
+
+              with scenes_path.open('r', encoding='utf-8') as sf:
+                  scenes = json.load(sf)
+
+              if 'duration' not in scenes:
+                  sys.exit(f"❌ {asset_name} -> scenes.json does not contain a duration field")
+
+              total_frames = math.ceil(float(scenes['duration']) * 30)
+              frames_per_worker = max(1, (total_frames + num_workers - 1) // num_workers)
+
+              videos.append({
+                  'video_id': video_id,
+                  'zip_name': asset_name,
+                  'zip_url': zip_url,
+                  'total_frames': total_frames,
+              })
+
+              for idx in range(num_workers):
+                  start = idx * frames_per_worker
+                  end = min(((idx + 1) * frames_per_worker) - 1, total_frames - 1)
+
+                  if start >= total_frames:
+                      break
+
+                  render_jobs.append({
+                      'video_id': video_id,
+                      'zip_name': asset_name,
+                      'zip_url': zip_url,
+                      'index': idx,
+                      'start': start,
+                      'end': end,
+                  })
+
+          print(f"Found {len(videos)} zip file(s) and built {len(render_jobs)} render job(s).")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as out:
+              out.write(f"render_matrix={json.dumps(render_jobs, separators=(',', ':'))}\n")
+              out.write(f"videos_matrix={json.dumps(videos, separators=(',', ':'))}\n")
+          PY
 
   render:
     needs: setup
     runs-on: ubuntu-latest
+
     strategy:
-      matrix:
-        chunk: ${{ fromJson(needs.setup.outputs.matrix) }}
       fail-fast: false
+      max-parallel: ${{ fromJson(inputs.max_parallel_jobs) }}
+      matrix:
+        chunk: ${{ fromJson(needs.setup.outputs.render_matrix) }}
+
     steps:
       - uses: actions/checkout@v4
-      - name: Download assets
+
+      - name: Download assets for ${{ matrix.chunk.zip_name }}
         run: |
-          curl -L -o assets.zip "${{ needs.setup.outputs.zip_url }}"
+          set -euo pipefail
+          mkdir -p public
+          curl -sSL -o assets.zip "${{ matrix.chunk.zip_url }}"
           unzip -o assets.zip -d public/
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+
       - run: npm ci
+
       - name: Ensure Chrome
         run: npx remotion browser ensure
-      - name: Render chunk ${{ matrix.chunk.index }}
+
+      - name: Render ${{ matrix.chunk.video_id }} chunk ${{ matrix.chunk.index }}
         run: |
-          npx remotion render ${{ inputs.composition }} chunk_${{ matrix.chunk.index }}.mp4 \
+          set -euo pipefail
+          OUT_FILE="chunk_${{ matrix.chunk.video_id }}_${{ matrix.chunk.index }}.mp4"
+
+          npx remotion render ${{ inputs.composition }} "$OUT_FILE" \
             --frames=${{ matrix.chunk.start }}-${{ matrix.chunk.end }} \
-            --concurrency=2 --image-format=jpeg --video-bitrate=8M --codec=h264 --overwrite
+            --concurrency=2 \
+            --image-format=jpeg \
+            --video-bitrate=8M \
+            --codec=h264 \
+            --overwrite
+
       - uses: actions/upload-artifact@v4
         with:
-          name: chunk-${{ inputs.release_tag }}-${{ matrix.chunk.index }}
-          path: chunk_${{ matrix.chunk.index }}.mp4
+          name: chunk-${{ matrix.chunk.video_id }}-${{ matrix.chunk.index }}
+          path: chunk_${{ matrix.chunk.video_id }}_${{ matrix.chunk.index }}.mp4
           retention-days: 1
 
   stitch:
     needs: [setup, render]
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        video: ${{ fromJson(needs.setup.outputs.videos_matrix) }}
+
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: chunk-${{ inputs.release_tag }}-*
+          pattern: chunk-${{ matrix.video.video_id }}-*
           path: chunks/
-      - name: Stitch
+
+      - name: Stitch ${{ matrix.video.video_id }}
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
-          for f in $(find chunks/ -name "*.mp4" | sort -t_ -k2 -n); do
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+          find chunks -name "*.mp4" | sort -V > chunk_files.txt
+
+          if [ ! -s chunk_files.txt ]; then
+            echo "❌ No chunk files found for ${{ matrix.video.video_id }}"
+            exit 1
+          fi
+
+          rm -f list.txt
+
+          while IFS= read -r f; do
             echo "file '$(pwd)/$f'" >> list.txt
-          done
-          ffmpeg -y -f concat -safe 0 -i list.txt -c copy output.mp4
-          echo "Size: $(du -h output.mp4 | cut -f1)"
+          done < chunk_files.txt
+
+          ffmpeg -y -f concat -safe 0 -i list.txt -c copy "${{ matrix.video.video_id }}.mp4"
+
+          echo "Finished ${{ matrix.video.video_id }}.mp4"
+          echo "Size: $(du -h "${{ matrix.video.video_id }}.mp4" | cut -f1)"
+
       - uses: actions/upload-artifact@v4
         with:
-          name: video-${{ inputs.release_tag }}
-          path: output.mp4
+          name: video-${{ matrix.video.video_id }}
+          path: ${{ matrix.video.video_id }}.mp4
           retention-days: 7
