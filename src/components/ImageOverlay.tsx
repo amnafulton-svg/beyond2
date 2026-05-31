@@ -2,7 +2,7 @@ import React from "react";
 import {
   AbsoluteFill,
   Img,
-  OffthreadVideo,
+  Video,
   useCurrentFrame,
   useVideoConfig,
   interpolate,
@@ -82,7 +82,7 @@ export const ImageOverlay: React.FC<{ scene: ImageScene }> = ({ scene }) => {
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
       {/* Background video — full frame, looping, muted */}
       <AbsoluteFill>
-        <OffthreadVideo
+        <Video
           src={staticFile(CONFIG.backgroundVideo)}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
           muted

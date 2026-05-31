@@ -1,5 +1,11 @@
 import React from "react";
-import { AbsoluteFill, Video, Sequence, staticFile, useVideoConfig } from "remotion";
+import {
+  AbsoluteFill,
+  OffthreadVideo,
+  Sequence,
+  staticFile,
+  useVideoConfig,
+} from "remotion";
 import { ImageOverlay } from "./components/ImageOverlay";
 import { QuoteOverlay } from "./components/QuoteOverlay";
 import { HeadlineOverlay } from "./components/HeadlineOverlay";
@@ -20,7 +26,7 @@ import type {
   NumberOverlay as NumberOverlayData,
 } from "./types";
 
-export interface MainCompositionProps {
+export interface MainCompositionProps extends Record<string, unknown> {
   scenes: Scene[];
   words?: WhisperWord[];
 }
@@ -50,7 +56,7 @@ export const MainComposition: React.FC<MainCompositionProps> = ({ scenes, words 
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
       {/* Bottom layer: avatar video (never cut, never sliced) */}
       <AbsoluteFill>
-        <Video
+        <OffthreadVideo
           src={staticFile("avatar.mp4")}
           style={{ width: "100%", height: "100%", objectFit: "cover" }}
         />

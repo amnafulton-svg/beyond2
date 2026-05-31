@@ -116,7 +116,7 @@ jobs:
               if 'duration' not in scenes:
                   sys.exit(f"❌ {asset_name} -> scenes.json does not contain a duration field")
 
-              total_frames = math.ceil(float(scenes['duration']) * 30)
+              total_frames = math.ceil(float(scenes['duration']) * 25)
               frames_per_worker = max(1, (total_frames + num_workers - 1) // num_workers)
 
               videos.append({
