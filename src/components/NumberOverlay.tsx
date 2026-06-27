@@ -36,6 +36,7 @@ function parseNumberValue(value: string): {
   const [, prefix, numberText, suffix] = match;
   const cleanNumber = numberText.replace(/,/g, "");
   const number = Number.parseFloat(cleanNumber);
+
   if (!Number.isFinite(number)) {
     return { prefix: "", number: 0, decimals: 0, suffix: value, hasNumber: false };
   }
@@ -82,6 +83,7 @@ function parseDateValue(value: string):
   | null {
   const match = value.match(DATE_RE);
   if (!match) return null;
+
   return {
     month: match[1].slice(0, 3).toUpperCase(),
     day: match[2],
@@ -92,52 +94,67 @@ function parseDateValue(value: string):
 export const NumberOverlay: React.FC<{
   overlay: NumberOverlayData;
   durationInFrames: number;
-}> = ({
-  overlay,
-  durationInFrames,
-}) => {
+}> = ({ overlay, durationInFrames }) => {
   const frame = useCurrentFrame();
   const { fps } = useVideoConfig();
 
+  const safeDuration = Math.max(1, durationInFrames);
+
   const parsed = React.useMemo(() => parseNumberValue(overlay.value), [overlay.value]);
+
   const enter = spring({
     frame,
     fps,
     config: { damping: 13, stiffness: 145, mass: 0.72 },
   });
 
-  const exitStart = Math.max(8, durationInFrames - Math.round(fps * 0.38));
-  const exit = interpolate(frame, [exitStart, durationInFrames], [0, 1], {
-    extrapolateLeft: "clamp",
-    extrapolateRight: "clamp",
-  });
+  const exitStart = Math.max(
+    0,
+    Math.min(safeDuration - 1, safeDuration - Math.round(fps * 0.38))
+  );
 
-  const countProgress = interpolate(frame, [0, Math.min(32, durationInFrames)], [0, 1], {
+  const exit =
+    safeDuration <= 1
+      ? 1
+      : interpolate(frame, [exitStart, safeDuration], [0, 1], {
+          extrapolateLeft: "clamp",
+          extrapolateRight: "clamp",
+        });
+
+  const countEnd = Math.max(1, Math.min(32, safeDuration));
+
+  const countProgress = interpolate(frame, [0, countEnd], [0, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
     easing: (x) => 1 - Math.pow(1 - x, 3),
   });
 
   const opacity = interpolate(enter, [0, 0.2, 1], [0, 1, 1]) * (1 - exit);
+
   const translateX = interpolate(enter, [0, 1], [-120, 0], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
   });
+
   const scale = interpolate(enter, [0, 0.72, 1], [0.84, 1.08, 1], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
   });
+
   const exitY = interpolate(exit, [0, 1], [0, 34]);
   const blur = interpolate(exit, [0, 1], [0, 8]);
+
   const pulse = interpolate(frame % 54, [0, 18, 54], [0.84, 1, 0.84], {
     extrapolateLeft: "clamp",
     extrapolateRight: "clamp",
   });
 
   const currentNumber = parsed.number * countProgress;
+
   const displayValue = parsed.hasNumber
     ? `${parsed.prefix}${formatNumber(currentNumber, parsed.decimals)}${parsed.suffix}`
     : overlay.value;
+
   const displayLabel = cleanLabel(overlay.label);
   const fontSize = valueFontSize(displayValue);
   const isLongValue = displayValue.length > 13;
@@ -198,6 +215,7 @@ export const NumberOverlay: React.FC<{
               >
                 {dateValue.month}
               </div>
+
               <div
                 style={{
                   fontFamily: serifFont,
@@ -210,6 +228,7 @@ export const NumberOverlay: React.FC<{
               >
                 {dateValue.day}
               </div>
+
               {dateValue.year && (
                 <div
                   style={{
@@ -246,6 +265,7 @@ export const NumberOverlay: React.FC<{
               >
                 Dateline
               </div>
+
               <div
                 style={{
                   fontFamily: sansFont,
@@ -258,6 +278,7 @@ export const NumberOverlay: React.FC<{
               >
                 {displayLabel || "Key date in the story"}
               </div>
+
               <div
                 style={{
                   width: 82,
